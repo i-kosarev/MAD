@@ -185,11 +185,21 @@ if [ "$MODEL_REPO" == "Llama-3.1-8B" ]; then
   if [[ "$DEVICE" == "MI355X" || "$DEVICE" == "MI350X" ]]; then
     MBS=4
     GBS=512
-    run_primus "$EXP"
+    original_gbs=$GBS
+    GBS=$(normalize_global_batch_size "$MBS" "$GBS" "$NUM_GPUS")
+    if [[ "$GBS" != "$original_gbs" ]]; then
+      echo "[INFO] Adjusted global batch size for distributed run: ${original_gbs} -> ${GBS} (MBS=${MBS}, NUM_GPUS=${NUM_GPUS})"
+    fi
+    run_primus "$EXP" --micro_batch_size $MBS --global_batch_size $GBS
   elif [[ "$DEVICE" == "MI300X" || "$DEVICE" == "MI325X" ]]; then
     MBS=2
     GBS=128
-    run_primus "$EXP"
+    original_gbs=$GBS
+    GBS=$(normalize_global_batch_size "$MBS" "$GBS" "$NUM_GPUS")
+    if [[ "$GBS" != "$original_gbs" ]]; then
+      echo "[INFO] Adjusted global batch size for distributed run: ${original_gbs} -> ${GBS} (MBS=${MBS}, NUM_GPUS=${NUM_GPUS})"
+    fi
+    run_primus "$EXP" --micro_batch_size $MBS --global_batch_size $GBS
   fi
   if [ -f "$TRAIN_LOG" ]; then
     echo "[INFO] Benchmarking"

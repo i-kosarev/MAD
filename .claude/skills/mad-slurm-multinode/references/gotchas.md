@@ -221,3 +221,25 @@ print_rank_last throughput last global rank, multi-node perf collection rank-0.
   `skip_perf_collection` SLURM node as SUCCESS). Use a madengine that has this
   multi-node aggregation (present in ROCm/madengine `develop`); otherwise the run
   trains fine but is mis-reported as FAILED with an empty `perf.csv`.
+
+- **The 8B batch sizes must be normalized to the world size, like the 70B branch.**
+  `primus_megatron-lm_benchmark_report.sh` hardcodes MBS/GBS per device; the 70B
+  branch runs the GBS through `normalize_global_batch_size` (rounds up to the next
+  multiple of `MBS * NUM_GPUS`) and passes explicit `--micro_batch_size` /
+  `--global_batch_size`, but the 8B branch did not. At any node count where
+  `GBS % (MBS * world_size) != 0` (e.g. a 3-node/24-GPU run: 512 % (4*24) != 0),
+  Megatron aborts at startup with `global batch size ... is not divisible by micro
+  batch size ... times data parallel size`. Fix: the 8B branch now normalizes GBS
+  and passes the explicit batch overrides too. Any new per-model branch that
+  hardcodes GBS needs the same normalize step to be node-count-portable.
+
+- **`rocm/primus:v26.4` auto-loads `librccl-anp.so`, which deadlocks a bundled
+  RCCL overlay — set `NCCL_NET_PLUGIN=none`.** The v26.4 base image ships an
+  environment default of `NCCL_NET_PLUGIN=librccl-anp.so` (the ANP net plugin).
+  When the image carries a *bundled* RCCL overlay (the whole point of the
+  `rccl_overlay` Dockerfile), that plugin is incompatible with the overlay
+  `librccl` and RCCL init hangs at the first collective — the run never starts and
+  eventually times out. Set `NCCL_NET_PLUGIN=none` in the manifest env (both
+  `context.docker_env_vars` and `deployment_config.env_vars`, like the other
+  transport vars) to disable the plugin and let the bundled `librccl` drive the
+  IB/RoCE net path directly. The primus template ships this key set to `none`.
