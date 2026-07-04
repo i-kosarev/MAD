@@ -33,11 +33,33 @@ esac
 pip install py-spy
 pip install --ignore-installed --force-reinstall flask
 
+# AINIC/ionic RoCE fix: MOONCAKE_COOKBOOK's set_env_vars.sh assumes a Mellanox/mlx5
+# fabric. On ionic-based RoCE clusters (e.g. mia1) it (1) hardcodes mlx5 IB device
+# names, (2) forces NCCL_IB_DISABLE=1, and (3) mangles NCCL_SOCKET_IFNAME via an
+# `ip route` awk parse. Save the transport iface set by the launcher, then re-assert
+# the correct ionic values after sourcing so RDMA over ionic actually engages.
+_SAVED_NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-}"
+
 source $MOONCAKE_COOKBOOK_PATH/set_env_vars.sh
 #trap 'echo "Error occurred. Cleaning up..."; exit 0' ERR
 
-host_ip=$(hostname -I | awk '{print $1}')
+# Re-assert RDMA/socket env clobbered by set_env_vars.sh (see note above).
+export NCCL_IB_DISABLE=0
+[[ -n "${IB_DEVICES:-}" ]] && export IBDEVICES="${IB_DEVICES}"
+export NCCL_SOCKET_IFNAME="${_SAVED_NCCL_SOCKET_IFNAME:-eno0}"
+export GLOO_SOCKET_IFNAME="${_SAVED_NCCL_SOCKET_IFNAME%%,*}"
+
+# Derive host_ip from the actual transport interface rather than the first
+# `hostname -I` address (which on multi-homed nodes may be the wrong NIC).
+_XPORT_IFACE="${_SAVED_NCCL_SOCKET_IFNAME%%,*}"
+host_ip=""
+if [[ -n "$_XPORT_IFACE" ]]; then
+    host_ip=$(ip -4 -o addr show "$_XPORT_IFACE" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)
+fi
+[[ -z "$host_ip" ]] && host_ip=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
+[[ -z "$host_ip" ]] && host_ip=$(hostname -I | awk '{print $1}')
 host_name=$(hostname)
+unset _SAVED_NCCL_SOCKET_IFNAME _XPORT_IFACE
 
 # =============================================================================
 # Model-Specific Configuration Maps
