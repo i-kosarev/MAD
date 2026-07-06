@@ -96,6 +96,19 @@ RUN if [[ -n "${RCCL_COMMIT}" ]]; then \
     git -C "$(cat /tmp/BLD_RCCL_HOME.txt)" rev-parse HEAD > "${RCCL_INSTALL_DIR}/RCCL_BUILT_SHA" && \
     echo "RCCL_BUILT_SHA=$(cat ${RCCL_INSTALL_DIR}/RCCL_BUILT_SHA)"
 
+# v26.4 compat: ROCm ships as pip wheels and the amdclang++ wrapper in
+# _rocm_sdk_devel/bin/ resolves its clang++/clang-23 helpers relative to its own
+# directory -- but those binaries live ONLY in _rocm_sdk_devel/lib/llvm/bin/.
+# RCCL's device-code compile invokes bin/amdclang++ directly and dies with
+# "amdclang++: binary '.../_rocm_sdk_devel/bin/clang++' does not exist". Symlink
+# the helpers into bin/ so the wrapper resolves. No-op on v26.3 / non-wheel bases.
+# (Fixing CC/CXX is NOT enough: --offload-device-only still calls bin/amdclang++.)
+RUN SDK="$(ls -d /opt/venv/lib/python*/site-packages/_rocm_sdk_devel 2>/dev/null || true)" && \
+    if [ -n "$SDK" ] && [ ! -e "$SDK/bin/clang++" ] && [ -d "$SDK/lib/llvm/bin" ]; then \
+      for b in clang clang++ clang-23; do ln -sf ../lib/llvm/bin/$b "$SDK/bin/$b"; done; \
+      echo "[v26.4-fix] symlinked clang/clang++/clang-23 into $SDK/bin"; \
+    fi
+
 RUN set -e && \
     BLD_RCCL_HOME=$(cat /tmp/BLD_RCCL_HOME.txt) && \
     cd "${BLD_RCCL_HOME}" && \
