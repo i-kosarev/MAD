@@ -49,17 +49,15 @@ export NCCL_IB_DISABLE=0
 export NCCL_SOCKET_IFNAME="${_SAVED_NCCL_SOCKET_IFNAME:-eno0}"
 export GLOO_SOCKET_IFNAME="${_SAVED_NCCL_SOCKET_IFNAME%%,*}"
 
-# Derive host_ip from the actual transport interface rather than the first
-# `hostname -I` address (which on multi-homed nodes may be the wrong NIC).
-_XPORT_IFACE="${_SAVED_NCCL_SOCKET_IFNAME%%,*}"
-host_ip=""
-if [[ -n "$_XPORT_IFACE" ]]; then
-    host_ip=$(ip -4 -o addr show "$_XPORT_IFACE" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)
-fi
-[[ -z "$host_ip" ]] && host_ip=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
-[[ -z "$host_ip" ]] && host_ip=$(hostname -I | awk '{print $1}')
+# This node's IP is already resolved by run.sh and handed to us (rank-ordered,
+# post-rendezvous) via IPADDRS. Reuse IPADDRS[NODE_RANK] so the address we bind
+# and advertise (--host, socket_barrier --local-ip) matches exactly what peers
+# registered for us in the router/barrier; re-deriving it here can pick a
+# different NIC on multi-homed nodes and desync the two.
+IFS=',' read -ra IP_ARRAY <<< "$IPADDRS"
+host_ip="${IP_ARRAY[NODE_RANK]:-$(hostname -I | awk '{print $1}')}"
 host_name=$(hostname)
-unset _SAVED_NCCL_SOCKET_IFNAME _XPORT_IFACE
+unset _SAVED_NCCL_SOCKET_IFNAME
 
 # =============================================================================
 # Model-Specific Configuration Maps
@@ -134,7 +132,7 @@ python $MOONCAKE_COOKBOOK_PATH/socket_barrier.py \
 # Cluster Topology Configuration
 # =============================================================================
 
-IFS=',' read -ra IP_ARRAY <<< "$IPADDRS"
+# IP_ARRAY was already parsed from IPADDRS above (where host_ip is derived).
 
 PREFILL_ARGS=""
 DECODE_ARGS=""
