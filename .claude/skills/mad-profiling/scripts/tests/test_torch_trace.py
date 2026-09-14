@@ -9,7 +9,8 @@ import pytest
 from conftest import trace_event, write
 
 from collprof.core.spec import TraceLayout
-from collprof.core.torch_trace import canonical_collective, parse_traces, rank_of
+from collprof.core.torch_trace import (canonical_collective, parse_traces, rank_of,
+                                       trace_files)
 from collprof.engines import primus, sglang_disagg
 
 SGL = sglang_disagg.SPEC.traces
@@ -75,6 +76,82 @@ def test_a_gzipped_trace_is_read(tmp_path: Path):
     assert parse_traces([tmp_path], SGL)["files"] == 1
 
 
+def truncate(path: Path, keep: float = 0.75) -> Path:
+    """Lop the tail off a gzip member, as a rank killed at teardown leaves behind."""
+    body = path.read_bytes()
+    path.write_bytes(body[:int(len(body) * keep)])
+    return path
+
+
+def test_a_trace_cut_off_mid_stream_keeps_what_it_held(tmp_path: Path):
+    """A trace truncated mid-stream is reported as truncated and its earlier events kept."""
+    whole = tmp_path / "1000.0-TP-0.trace.json.gz"
+    write(whole, ['{"traceEvents": ['] + [trace_event()] * 200 + [']}'], compress=True)
+    truncate(whole)
+
+    parsed = parse_traces([tmp_path], SGL)
+
+    assert parsed["truncated"] == [whole.name]
+    assert parsed["files"] == 1
+    (calls, _dur), = parsed["events"].values()
+    assert 0 < calls < 200, "the events before the cut are kept, the ones after it are not"
+
+
+def test_a_duration_that_is_not_a_number_loses_the_duration_not_the_call(tmp_path: Path):
+    """An unparseable `dur` is counted as a call with no duration, not dropped or invented."""
+    good = trace_event(cat="kernel", dur=50.0)
+    spliced = good.replace('"dur": 50.0', '"dur": 4.200.347')
+    assert spliced != good, "the fixture must actually carry a spliced duration"
+    trace_file(tmp_path / "1000.0-TP-0.trace.json", [good, spliced])
+
+    parsed = parse_traces([tmp_path], SGL)
+
+    (count, example), = parsed["malformed"].values()
+    assert (count, example) == (1, "4.200.347")
+    (calls, dur), = parsed["events"].values()
+    assert calls == 2, "both collectives happened and both are counted"
+    assert dur == 50.0, "the spliced duration contributes nothing, and nothing is invented"
+
+
+def test_a_clean_trace_reports_nothing_malformed(tmp_path: Path):
+    trace_file(tmp_path / "1000.0-TP-0.trace.json", [trace_event(cat="kernel")])
+    assert parse_traces([tmp_path], SGL)["malformed"] == {}
+
+
+def test_a_trace_corrupt_mid_stream_keeps_what_it_held(tmp_path: Path):
+    """Gzip damage mid-stream (zlib.error, not OSError) is reported like truncation, not raised."""
+    whole = tmp_path / "1000.0-TP-0.trace.json.gz"
+    write(whole, ['{"traceEvents": ['] + [trace_event()] * 200 + [']}'], compress=True)
+    raw = bytearray(whole.read_bytes())
+    for i in range(len(raw) // 2, len(raw) // 2 + 200):
+        raw[i] ^= 0xFF
+    whole.write_bytes(bytes(raw))
+
+    parsed = parse_traces([tmp_path], SGL)
+
+    assert parsed["truncated"] == [whole.name], "corruption is reported, not raised on"
+    assert parsed["files"] == 1
+
+
+def test_a_whole_trace_reports_nothing_truncated(tmp_path: Path):
+    write(tmp_path / "1000.0-TP-0.trace.json.gz", ['{"traceEvents": [', trace_event(), ']}'],
+          compress=True)
+    assert parse_traces([tmp_path], SGL)["truncated"] == []
+
+
+def test_one_cut_trace_does_not_stop_the_ranks_after_it(tmp_path: Path):
+    """Files are read in name order, so a cut file must not shadow the ranks that follow it."""
+    truncate(write(tmp_path / "1000.0-TP-0.trace.json.gz",
+                   ['{"traceEvents": ['] + [trace_event()] * 200 + [']}'], compress=True))
+    write(tmp_path / "1000.0-TP-1.trace.json.gz", ['{"traceEvents": [', trace_event(), ']}'],
+          compress=True)
+
+    parsed = parse_traces([tmp_path], SGL)
+
+    assert parsed["files"] == 2
+    assert parsed["ranks"] == [0, 1], "rank 1 was read despite rank 0 ending early"
+
+
 def add_profile_point(run: Path, role: str, epochs: list) -> None:
     """A profile-point log as bench_serving writes it: the output_dir it asked each worker for."""
     lines = [f"INFO: profiling {role} worker(s)"]
@@ -132,3 +209,70 @@ def test_trace_discovery_says_what_it_looked_for(tmp_path: Path):
     (tmp_path / "empty").mkdir()
     with pytest.raises(FileNotFoundError, match=re.escape("*.trace.json")):
         parse_traces([tmp_path / "empty"], SGL)
+
+
+def test_a_path_that_is_neither_file_nor_directory_is_refused(tmp_path: Path):
+    """`trace_files` raises for a path that is neither a file nor a directory."""
+    with pytest.raises(FileNotFoundError):
+        trace_files(tmp_path / "absent.trace.json.gz", SGL)
+
+
+def test_a_trace_file_named_directly_is_still_read(tmp_path: Path):
+    """The existence check must not cost the caller the ability to name one file."""
+    one = write(tmp_path / "1000.0-TP-0.trace.json", ['{"traceEvents": [', trace_event(), ']}'])
+    assert trace_files(one, SGL) == [one]
+    assert parse_traces([one], SGL)["files"] == 1
+
+
+def test_a_malformed_duration_is_not_cached_either():
+    """A malformed duration biases the shares and the report advises reparsing, but the parse was
+    cached under the files' unchanged signature and reused for ever."""
+    from collprof.core.torch_trace import trace_is_complete
+
+    assert trace_is_complete({"truncated": 0, "malformed": {}})
+    assert not trace_is_complete({"truncated": 2, "malformed": {}})
+    assert not trace_is_complete({"truncated": 0, "malformed": {"t.json": [1, "4.200.347"]}})
+
+
+def test_a_duration_with_trailing_characters_is_malformed_not_truncated(tmp_path: Path):
+    """The duration pattern was unanchored, so `12x` parsed as 12 and `1e3` as 1: a biased value
+    that never reached `malformed` and could then be cached as a complete parse."""
+    trace_file(tmp_path / "one.trace.json", [
+        '{"ph":"X","cat":"kernel","name":"k","ts": 1.0,"dur": 12x},',
+        '{"ph":"X","cat":"kernel","name":"k","ts": 2.0,"dur": 5.0}'])
+
+    parsed = parse_traces([tmp_path], SGL)
+
+    assert parsed["malformed"], "the unparseable duration is recorded"
+    assert "12x" in str(parsed["malformed"]), "and the offending token is kept for the report"
+
+
+def test_a_non_finite_duration_is_malformed(tmp_path: Path):
+    """`float()` accepts `NaN` and `Infinity`, so they passed the parse and poisoned every sum
+    they reached while the result still counted as clean and cacheable."""
+    for token in ("NaN", "Infinity"):
+        d = tmp_path / token
+        d.mkdir()
+        trace_file(d / "one.trace.json", [
+            f'{{"ph":"X","cat":"kernel","name":"k","ts": 1.0,"dur": {token}}},',
+            '{"ph":"X","cat":"kernel","name":"k","ts": 2.0,"dur": 5.0}'])
+
+        parsed = parse_traces([d], SGL)
+
+        assert parsed["malformed"], f"{token} is recorded as malformed"
+        assert all(v == v and abs(v) != float("inf")
+                   for v in parsed["category_us"].values()), f"{token} reached a sum"
+
+
+def test_undecodable_bytes_are_truncation_not_a_different_number(tmp_path: Path):
+    """`errors="ignore"` deleted the bad byte, so `1\\xff2` arrived as `12`: a fabricated value
+    that passed the malformed check and could be cached as a complete parse."""
+    path = tmp_path / "one.trace.json"
+    path.write_bytes(b'{"traceEvents": [\n'
+                     b'{"ph":"X","cat":"kernel","name":"k","ts": 1.0,"dur": 1\xff2},\n'
+                     b'{"ph":"X","cat":"kernel","name":"k","ts": 2.0,"dur": 5.0}\n]}\n')
+
+    parsed = parse_traces([tmp_path], SGL)
+
+    assert parsed["truncated"], "the undecodable stream is reported, not silently repaired"
+    assert parsed["category_us"].get("kernel", 0) != 12, "no invented duration"

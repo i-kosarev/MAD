@@ -17,6 +17,18 @@ RE_MD_CODE = re.compile(r"`([^`]+)`")
 RE_MD_RULE = re.compile(r"^:?-{2,}:?$")
 
 
+def sanitise_cell(value):
+    """A cell that cannot be read as a formula. Defined here as well as in `report`, because a
+    workbook is built from CSVs this tool may not have written."""
+    if not isinstance(value, str) or not value.startswith(("=", "+", "-", "@", "\t", "\r")):
+        return value
+    try:
+        float(value)
+    except ValueError:
+        return "'" + value
+    return value
+
+
 def _as_number(value: str):
     """Spreadsheet cells should hold numbers, not strings that look like numbers."""
     try:
@@ -26,7 +38,9 @@ def _as_number(value: str):
     try:
         return float(value)
     except ValueError:
-        return value
+        # Not a number, so it lands in the cell as text -- and text a run wrote can start a
+        # formula. The numeric paths above are unaffected: a negative number stays one.
+        return sanitise_cell(value)
 
 
 def _plain(text: str) -> str:
@@ -64,7 +78,8 @@ def _write_report_sheet(ws, report_lines: list) -> None:
             for r, cells in enumerate(block):
                 row += 1
                 for col, value in enumerate(cells, start=1):
-                    cell = ws.cell(row, col, value if r == 0 else _as_number(value))
+                    cell = ws.cell(row, col,
+                                   sanitise_cell(value) if r == 0 else _as_number(value))
                     if r == 0:
                         cell.font = Font(bold=True)
                     elif col <= len(aligns):
@@ -79,7 +94,9 @@ def _write_report_sheet(ws, report_lines: list) -> None:
         if not line.strip():
             continue
         level = len(line) - len(line.lstrip("#"))
-        cell = ws.cell(row, 1, _plain(line.lstrip("#").lstrip(">")))
+        # Prose too, not only table cells: an arm label reaches the title, and `--left-name`
+        # is the caller's string.
+        cell = ws.cell(row, 1, sanitise_cell(_plain(line.lstrip("#").lstrip(">"))))
         if level:
             cell.font = Font(bold=True, size=14 if level == 1 else 12)
         elif line.startswith(">"):
@@ -91,7 +108,8 @@ def _write_report_sheet(ws, report_lines: list) -> None:
             ws.column_dimensions[get_column_letter(col)].width = min(max(width + 2, 8), 46)
 
 
-def write_workbook(out_dir: Path, report_lines: list) -> Path | None:
+def write_workbook(out_dir: Path, report_lines: list,
+                   filename: str = "profile.xlsx", only: set | None = None) -> Path | None:
     """One workbook per report: the text as cells, every CSV as a sortable table.
 
     The rank x rank sheet stays a plain grid and gets a colour scale instead, which is the heatmap:
@@ -105,7 +123,7 @@ def write_workbook(out_dir: Path, report_lines: list) -> Path | None:
         from openpyxl.worksheet.table import Table, TableStyleInfo
     except ImportError:
         print(f"warning: openpyxl is not installed in {sys.executable}, so "
-              f"{out_dir}/profile.xlsx was skipped; report.md and the CSVs still hold every "
+              f"{out_dir}/{filename} was skipped; the markdown and the CSVs still hold every "
               "number. `pip install openpyxl` and rerun to get the workbook.")
         return None
 
@@ -114,6 +132,10 @@ def write_workbook(out_dir: Path, report_lines: list) -> Path | None:
     _write_report_sheet(wb.create_sheet("report"), report_lines)
 
     for csv_path in sorted(out_dir.glob("*.csv")):
+        # A single-run report owns its directory; a comparison shares a caller-named one, where an
+        # unrelated CSV becoming a sheet can collide once stems truncate to 31 characters.
+        if only is not None and csv_path.name not in only:
+            continue
         with csv_path.open() as fh:
             rows = list(csv.reader(fh))
         if not rows:
@@ -155,6 +177,7 @@ def write_workbook(out_dir: Path, report_lines: list) -> Path | None:
             # +4 leaves room for the filter button the table adds to every header cell.
             ws.column_dimensions[get_column_letter(col)].width = min(max(width + 4, 10), 46)
 
-    path = out_dir / "profile.xlsx"
+    # Not `name`: that is rebound to a sheet name inside the loop above.
+    path = out_dir / filename
     wb.save(path)
     return path
